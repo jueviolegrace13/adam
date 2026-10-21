@@ -176,6 +176,65 @@ describe("ai-description", () => {
     expect(report.provider).toBe("gemini");
   });
 
+  it("gives Gemini room to think and retries once when it stops without the call", async () => {
+    const bodies: any[] = [];
+    globalThis.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(init?.body as string));
+      const parts = bodies.length === 1
+        ? [{ text: "thinking", thought: true }]
+        : [{ functionCall: { name: DESCRIBE_NODE_NAME, args: structuredDescription } }];
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ content: { parts }, finishReason: bodies.length === 1 ? "MAX_TOKENS" : "STOP" }] }),
+      } as Response;
+    });
+
+    const report = await describeNodeFile({
+      node: mockNode(),
+      content: { content: "export const value = 1;", masked: false, redactions: 0 },
+      provider: "gemini",
+      apiKey: "AQ.fake-key",
+    });
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].generationConfig.maxOutputTokens).toBeGreaterThanOrEqual(8192);
+    expect(bodies[0].generationConfig.temperature).toBeUndefined();
+    expect(report.summary).toContain("Handles user login");
+  });
+
+  it("accepts a JSON description Gemini returns as text instead of a call", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: "```json\n" + JSON.stringify(structuredDescription) + "\n```" }] } }],
+      }),
+    } as Response);
+
+    const report = await describeNodeFile({
+      node: mockNode(),
+      content: { content: "export const value = 1;", masked: false, redactions: 0 },
+      provider: "gemini",
+      apiKey: "AQ.fake-key",
+    });
+
+    expect(report.summary).toContain("Handles user login");
+  });
+
+  it("explains why Gemini gave no function call after the retry", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ candidates: [{ content: { parts: [] }, finishReason: "MAX_TOKENS" }] }),
+    } as Response);
+
+    await expect(describeNodeFile({
+      node: mockNode(),
+      content: { content: "export const value = 1;", masked: false, redactions: 0 },
+      provider: "gemini",
+      apiKey: "AQ.fake-key",
+    })).rejects.toThrow(/did not invoke the describe_node_file function \(the model ran out of output tokens/);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("supports Claude tool use", async () => {
     let capturedBody: any;
     globalThis.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {

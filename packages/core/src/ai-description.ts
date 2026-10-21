@@ -6,6 +6,7 @@ import {
   type NodeDescriptionReport,
   type NodeDescriptionSymbol,
 } from "./ai-types";
+import { callGeminiFunction, describeGeminiStop } from "./ai-gemini";
 import type { GraphNode } from "./types";
 
 export const DESCRIBE_NODE_NAME = "describe_node_file";
@@ -237,48 +238,31 @@ export async function describeNodeFile(options: DescribeNodeOptions): Promise<No
 
     switch (provider) {
       case "gemini": {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        const outcome = await callGeminiFunction(
+          model,
+          prompt,
+          apiKey,
           {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "User-Agent": "Adam-Code-Network/1.0",
-              "x-goog-api-key": apiKey,
-            },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts: [{ text: prompt }] }],
-              generationConfig: { maxOutputTokens: 2500, temperature: 0.1 },
-              tools: [{
-                functionDeclarations: [{
-                  name: DESCRIBE_NODE_NAME,
-                  description: DESCRIBE_NODE_DESCRIPTION,
-                  parameters: DESCRIBE_NODE_SCHEMA,
-                }],
-              }],
-              toolConfig: {
-                functionCallingConfig: {
-                  mode: "ANY",
-                  allowedFunctionNames: [DESCRIBE_NODE_NAME],
-                },
-              },
-            }),
-            signal: controller.signal,
+            name: DESCRIBE_NODE_NAME,
+            description: DESCRIBE_NODE_DESCRIPTION,
+            parameters: DESCRIBE_NODE_SCHEMA,
+            acceptsText: (parsed) => typeof parsed.summary === "string",
           },
-        );
-        if (!response.ok) {
-          throw new NodeDescriptionError(
-            `Gemini request failed (HTTP ${response.status}). Check the API key and selected model, then try again.`,
+          controller.signal,
+          (status) => new NodeDescriptionError(
+            `Gemini request failed (HTTP ${status}). Check the API key and selected model, then try again.`,
             "PROVIDER_ERROR",
-            response.status,
+            status,
+          ),
+        );
+        rawArgs = outcome.args;
+        if (rawArgs === undefined) {
+          throw new NodeDescriptionError(
+            `Provider gemini did not invoke the ${DESCRIBE_NODE_NAME} function (${describeGeminiStop(outcome.reason)})`,
+            "PARSE_ERROR",
+            502,
           );
         }
-        const data = await response.json() as {
-          candidates?: Array<{ content?: { parts?: Array<{ functionCall?: { name?: string; args?: unknown } }> } }>;
-        };
-        rawArgs = data.candidates?.[0]?.content?.parts?.find(
-          (part) => part.functionCall?.name === DESCRIBE_NODE_NAME,
-        )?.functionCall?.args;
         break;
       }
 
