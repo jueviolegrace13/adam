@@ -221,6 +221,116 @@ describe("ai-threats", () => {
       expect(report.threats[0].cwe).toBe("CWE-89");
     });
 
+    it("retries once when Gemini stops without the function call, then succeeds", async () => {
+      const calls: any[] = [];
+      globalThis.fetch = vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+        calls.push(JSON.parse(init.body as string));
+        if (calls.length === 1) {
+          return {
+            ok: true,
+            json: async () => ({ candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL", content: { parts: [] } }] }),
+          } as unknown as Response;
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      functionCall: {
+                        name: "report_security_threats",
+                        args: { summary: "Clean.", overallRisk: "info", threats: [] },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        } as unknown as Response;
+      });
+
+      const report = await analyzeNodeSecurityThreats({
+        node: mockNode(),
+        content: { content: "const a = 1;", masked: false, redactions: 0 },
+        provider: "gemini",
+        apiKey: "AQ.fakeGeminiKey12345",
+      });
+
+      expect(calls).toHaveLength(2);
+      expect(calls[0].generationConfig.maxOutputTokens).toBeGreaterThanOrEqual(8192);
+      expect(calls[0].generationConfig.temperature).toBeUndefined();
+      expect(report.summary).toBe("Clean.");
+      expect(report.threats).toHaveLength(0);
+    });
+
+    it("accepts a JSON report Gemini returns as text instead of a call", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: {
+                parts: [
+                  { text: "thinking...", thought: true },
+                  {
+                    text: '```json\n{"summary":"One issue.","overallRisk":"low","threats":[{"id":"T1","title":"Weak hash","category":"crypto","severity":"low","description":"md5","recommendation":"Use sha256."}]}\n```',
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      } as unknown as Response);
+
+      const report = await analyzeNodeSecurityThreats({
+        node: mockNode(),
+        content: { content: "md5(x)", masked: false, redactions: 0 },
+        provider: "gemini",
+        apiKey: "AQ.fakeGeminiKey12345",
+      });
+
+      expect(report.threats).toHaveLength(1);
+      expect(report.threats[0].category).toBe("crypto");
+    });
+
+    it("explains why Gemini gave no function call after the retry", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [] } }] }),
+      } as unknown as Response);
+
+      await expect(
+        analyzeNodeSecurityThreats({
+          node: mockNode(),
+          content: { content: "code", masked: false, redactions: 0 },
+          provider: "gemini",
+          apiKey: "AQ.fakeGeminiKey12345",
+        }),
+      ).rejects.toThrow("ran out of output tokens");
+      expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not retry when Gemini's safety filter blocks the prompt", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ promptFeedback: { blockReason: "SAFETY" } }),
+      } as unknown as Response);
+
+      await expect(
+        analyzeNodeSecurityThreats({
+          node: mockNode(),
+          content: { content: "code", masked: false, redactions: 0 },
+          provider: "gemini",
+          apiKey: "AQ.fakeGeminiKey12345",
+        }),
+      ).rejects.toThrow("safety filter");
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
     it("handles Gemini API errors", async () => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: false,

@@ -273,6 +273,133 @@ function sanitizeReport(
   };
 }
 
+/** Output budget for Gemini. Current Gemini models think before answering and the
+ * thinking tokens count against maxOutputTokens, so a small budget can run out
+ * before the function call is written. */
+const GEMINI_MAX_OUTPUT_TOKENS = 16384;
+
+interface GeminiOutcome {
+  args: unknown;
+  /** finishReason or promptFeedback.blockReason when no call came back. */
+  reason?: string;
+  retryable: boolean;
+}
+
+async function requestGeminiReport(
+  model: string,
+  prompt: string,
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<GeminiOutcome> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
+    // No temperature override: Gemini 3 models are tuned for the default and
+    // can loop or skip tool calls at low temperatures.
+    generationConfig: {
+      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
+    },
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: REPORT_SECURITY_THREATS_NAME,
+            description: REPORT_SECURITY_THREATS_DESCRIPTION,
+            parameters: REPORT_SECURITY_THREATS_SCHEMA,
+          },
+        ],
+      },
+    ],
+    toolConfig: {
+      functionCallingConfig: {
+        mode: "ANY",
+        allowedFunctionNames: [REPORT_SECURITY_THREATS_NAME],
+      },
+    },
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "Adam-Code-Network/1.0",
+      "x-goog-api-key": apiKey,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    throw new ThreatAnalysisError(`Gemini request failed (HTTP ${res.status}). Check the API key and selected model, then try again.`, "PROVIDER_ERROR", res.status);
+  }
+
+  const data = (await res.json()) as any;
+  const blockReason: string | undefined = data.promptFeedback?.blockReason;
+  if (blockReason) {
+    return { args: undefined, reason: blockReason, retryable: false };
+  }
+
+  const candidate = data.candidates?.[0];
+  const parts: any[] = candidate?.content?.parts ?? [];
+  for (const part of parts) {
+    if (part.functionCall && part.functionCall.name === REPORT_SECURITY_THREATS_NAME) {
+      const args = part.functionCall.args;
+      if (args && typeof args === "object") return { args, retryable: false };
+    }
+  }
+
+  // Some models answer with the report as JSON text instead of a call.
+  for (const part of parts) {
+    if (part.thought || typeof part.text !== "string") continue;
+    const parsed = parseJsonReport(part.text);
+    if (parsed) return { args: parsed, retryable: false };
+  }
+
+  const reason: string | undefined = candidate?.finishReason;
+  return {
+    args: undefined,
+    reason,
+    retryable: reason !== "SAFETY" && reason !== "PROHIBITED_CONTENT" && reason !== "BLOCKLIST",
+  };
+}
+
+/** Parses a report object out of model text, with or without a ```json fence. */
+function parseJsonReport(text: string): Record<string, unknown> | undefined {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text);
+  const candidate = (fenced ? fenced[1] : text).trim();
+  if (!candidate.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(candidate);
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.threats)) return parsed;
+  } catch {
+    // not JSON
+  }
+  return undefined;
+}
+
+function describeGeminiStop(reason: string | undefined): string {
+  switch (reason) {
+    case "MAX_TOKENS":
+      return "the model ran out of output tokens; try a smaller file or another model";
+    case "MALFORMED_FUNCTION_CALL":
+      return "the model produced a malformed function call; try again or pick another model";
+    case "SAFETY":
+    case "PROHIBITED_CONTENT":
+    case "BLOCKLIST":
+      return "Gemini's safety filter blocked the response";
+    case undefined:
+    case "":
+      return "no function call in the response";
+    default:
+      return `finish reason ${reason}`;
+  }
+}
+
 /**
  * Dispatches node security threat analysis to the configured AI provider via function calling.
  */
@@ -309,60 +436,19 @@ export async function analyzeNodeSecurityThreats(
 
     switch (provider) {
       case "gemini": {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-        const body = {
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: prompt }],
-            },
-          ],
-          generationConfig: {
-            maxOutputTokens: 2048,
-            temperature: 0.1,
-          },
-          tools: [
-            {
-              functionDeclarations: [
-                {
-                  name: REPORT_SECURITY_THREATS_NAME,
-                  description: REPORT_SECURITY_THREATS_DESCRIPTION,
-                  parameters: REPORT_SECURITY_THREATS_SCHEMA,
-                },
-              ],
-            },
-          ],
-          toolConfig: {
-            functionCallingConfig: {
-              mode: "ANY",
-              allowedFunctionNames: [REPORT_SECURITY_THREATS_NAME],
-            },
-          },
-        };
-
-        const res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": "Adam-Code-Network/1.0",
-            "x-goog-api-key": trimmedKey,
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-
-        if (!res.ok) {
-          throw new ThreatAnalysisError(`Gemini request failed (HTTP ${res.status}). Check the API key and selected model, then try again.`, "PROVIDER_ERROR", res.status);
+        // Gemini sometimes ends a turn without the function call (thinking used
+        // up the output budget, or a malformed call). Retry once before failing.
+        let outcome = await requestGeminiReport(model, prompt, trimmedKey, controller.signal);
+        if (outcome.args === undefined && outcome.retryable) {
+          outcome = await requestGeminiReport(model, prompt, trimmedKey, controller.signal);
         }
-
-        const data = (await res.json()) as any;
-        const candidate = data.candidates?.[0];
-        const parts = candidate?.content?.parts ?? [];
-        for (const part of parts) {
-          if (part.functionCall && part.functionCall.name === REPORT_SECURITY_THREATS_NAME) {
-            rawArgs = part.functionCall.args;
-            break;
-          }
+        rawArgs = outcome.args;
+        if (rawArgs === undefined) {
+          throw new ThreatAnalysisError(
+            `Provider gemini did not invoke the ${REPORT_SECURITY_THREATS_NAME} function (${describeGeminiStop(outcome.reason)})`,
+            "PARSE_ERROR",
+            502,
+          );
         }
         break;
       }
