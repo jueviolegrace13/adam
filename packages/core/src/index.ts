@@ -14,6 +14,14 @@ export {
   REPORT_SECURITY_THREATS_SCHEMA,
   type AnalyzeThreatsOptions,
 } from "./ai-threats";
+export {
+  buildNodeDescriptionPrompt,
+  describeNodeFile,
+  DESCRIBE_NODE_DESCRIPTION,
+  DESCRIBE_NODE_NAME,
+  DESCRIBE_NODE_SCHEMA,
+  type DescribeNodeOptions,
+} from "./ai-description";
 export { indexRepository } from "./indexer";
 export { languageOf, SCRIPT_EXTENSIONS } from "./language";
 export { parseScript } from "./parse-script";

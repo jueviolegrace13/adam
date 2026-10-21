@@ -2,6 +2,7 @@ import type {
   CodeSymbol,
   GraphEdge,
   GraphNode,
+  NodeDescriptionReport,
   NodeThreat,
   NodeThreatReport,
   ThreatCategory,
@@ -35,6 +36,85 @@ export interface PanelContext {
 
 export const threatCache = new Map<string, NodeThreatReport>();
 export const patchedThreats = new Set<string>();
+export const descriptionCache = new Map<string, NodeDescriptionReport>();
+
+const LANGUAGE_LABELS: Record<string, string> = {
+  typescript: "TypeScript source",
+  javascript: "JavaScript source",
+  csharp: "C# source",
+  msbuild: "MSBuild project file",
+  solution: ".NET solution file",
+  json: "JSON file",
+  markdown: "Markdown document",
+  css: "CSS stylesheet",
+  scss: "SCSS stylesheet",
+  html: "HTML document",
+  python: "Python source",
+  java: "Java source",
+  go: "Go source",
+  rust: "Rust source",
+  sql: "SQL script",
+  yaml: "YAML configuration file",
+  xml: "XML file",
+  dotenv: "environment configuration file",
+};
+
+function countLabel(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function symbolSummary(node: GraphNode): string | undefined {
+  if (!node.symbols.length) return undefined;
+  const counts = new Map<string, number>();
+  for (const symbol of node.symbols) counts.set(symbol.kind, (counts.get(symbol.kind) ?? 0) + 1);
+  const pair = (singular: string, plural: string): readonly [string, string] => [singular, plural];
+  const labels: Record<string, readonly [string, string]> = {
+    function: pair("function", "functions"),
+    method: pair("method", "methods"),
+    constructor: pair("constructor", "constructors"),
+    accessor: pair("accessor", "accessors"),
+    class: pair("class", "classes"),
+    interface: pair("interface", "interfaces"),
+    type: pair("type", "types"),
+    enum: pair("enum", "enums"),
+    variable: pair("constant", "constants"),
+  };
+  return [...counts]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([kind, count]) => {
+      const [singular, plural] = labels[kind] ?? ([kind, `${kind}s`] as [string, string]);
+      return countLabel(count, singular, plural);
+    })
+    .join(", ");
+}
+
+/** Builds a safe summary from indexed metadata; it never reads or includes file contents. */
+function describeNode(node: GraphNode, incoming: number, outgoing: number): string {
+  if (node.sensitive) {
+    const declared = node.envDeclares.length
+      ? ` Adam can show ${countLabel(node.envDeclares.length, "declared key")} only; its values remain hidden.`
+      : " Its values remain hidden.";
+    return `This protected ${node.language} file is masked to keep its contents private.${declared}`;
+  }
+  if (node.binary) return `This binary ${node.language} file is kept as a node but is not parsed for code symbols or imports.`;
+
+  const kind = LANGUAGE_LABELS[node.language] ?? `${node.language[0]?.toUpperCase() ?? ""}${node.language.slice(1)} file`;
+  const location = node.folder ? ` in the ${node.folder} folder` : " at the repository root";
+  const parts = [`This ${kind} is${location}.`];
+  const symbols = symbolSummary(node);
+  if (symbols) parts.push(`It defines ${symbols}.`);
+  else if (node.parsed) parts.push("It does not declare any indexed functions, classes, or types.");
+  else parts.push("It was indexed as a file, but its language is not parsed for symbols.");
+  if (outgoing) parts.push(`It imports ${countLabel(outgoing, "local file")}.`);
+  if (incoming) parts.push(`It is imported by ${countLabel(incoming, "file")}.`);
+  if (node.packages.length) {
+    const packageNames = node.packages.slice(0, 3).join(", ");
+    const suffix = node.packages.length > 3 ? `, and ${node.packages.length - 3} more` : "";
+    parts.push(`It uses ${packageNames}${suffix}.`);
+  }
+  if (node.envReads.length) parts.push(`It reads ${countLabel(node.envReads.length, "environment or configuration value")}.`);
+  return parts.join(" ");
+}
 
 /**
  * The node panel: what a file is, what it connects to, and its symbols collapsed by default.
@@ -43,6 +123,8 @@ export const patchedThreats = new Set<string>();
 export function renderNodePanel(container: HTMLElement, node: GraphNode, ctx: PanelContext): void {
   const { host } = ctx;
   container.replaceChildren();
+  const descriptionBody = h("div", { class: "node-description" });
+  renderNodeDescriptionSection(descriptionBody, node, ctx);
 
   const openButton =
     host.openFile && !node.binary
@@ -72,6 +154,7 @@ export function renderNodePanel(container: HTMLElement, node: GraphNode, ctx: Pa
       ),
       h("div", { class: "panel-actions" }, openButton, ...(ctx.actions ?? [])),
     ),
+    section("Description", descriptionBody),
   );
 
   if (node.sensitive) {
@@ -266,6 +349,216 @@ function linkList(links: UnitLink[], empty: string, ctx: GroupPanelContext): HTM
         h("span", { class: "edge-kind", title: "File-level imports" }, `${l.count}`),
       ),
     ),
+  );
+}
+
+function renderNodeDescriptionSection(
+  container: HTMLElement,
+  node: GraphNode,
+  ctx: PanelContext,
+): void {
+  const localSummary = () => h(
+    "p",
+    { class: "panel-description" },
+    describeNode(node, ctx.incoming.length, ctx.outgoing.length),
+  );
+
+  if (node.sensitive) {
+    descriptionCache.delete(node.id);
+    container.replaceChildren(
+      localSummary(),
+      h(
+        "p",
+        { class: "notice warn node-description-sensitive-notice" },
+        "🔒 AI description unavailable: this file is classified as sensitive and will not be sent to an external model.",
+      ),
+    );
+    return;
+  }
+
+  if (node.binary) {
+    container.replaceChildren(
+      localSummary(),
+      h("p", { class: "muted small" }, "AI description is unavailable for binary files."),
+    );
+    return;
+  }
+
+  const cached = descriptionCache.get(node.id);
+  if (cached && cached.nodeHash !== node.hash) descriptionCache.delete(node.id);
+  const current = descriptionCache.get(node.id);
+  if (current) renderReport(current);
+  else renderReady();
+
+  function renderReady(error?: string): void {
+    const children: HTMLElement[] = [localSummary()];
+    if (error) {
+      const isUnconfigured = /unconfigured|no active ai provider|no api key|not configured/i.test(error);
+      children.push(
+        h(
+          "div",
+          { class: "notice danger node-description-error" },
+          h("p", {}, error),
+          isUnconfigured && ctx.host.kind === "vscode"
+            ? h(
+                "button",
+                {
+                  class: "primary node-description-config-btn",
+                  onclick: () => void openAiSettingsDialog(ctx.host),
+                },
+                "✨ Configure AI Provider",
+              )
+            : null,
+        ),
+      );
+    }
+
+    if (ctx.host.kind !== "vscode") {
+      children.push(h("p", { class: "muted small" }, "AI file descriptions are available in the VS Code extension."));
+      container.replaceChildren(...children);
+      return;
+    }
+
+    children.push(
+      h(
+        "button",
+        {
+          class: "primary node-describe-btn",
+          title: "Inspect this file and generate a source-grounded explanation",
+          onclick: () => void startDescription(false),
+        },
+        "✨ Check & Describe",
+      ),
+      h(
+        "p",
+        { class: "muted small node-description-disclosure" },
+        node.secretHints > 0
+          ? "Secret-looking values will be removed before the sanitized source is sent to your active AI provider."
+          : "The sanitized source is sent to your active AI provider only when you choose this action.",
+      ),
+    );
+    container.replaceChildren(...children);
+  }
+
+  async function startDescription(forceRefresh: boolean): Promise<void> {
+    container.replaceChildren(
+      localSummary(),
+      h(
+        "div",
+        { class: "node-description-loading", role: "status" },
+        h("span", { class: "node-description-spinner", "aria-hidden": "true" }, "✨"),
+        h("span", {}, "Checking the selected file and preparing its description…"),
+      ),
+    );
+
+    try {
+      const report = await ctx.host.describeNode({ nodeId: node.id, forceRefresh });
+      if (report.nodeHash !== node.hash) {
+        renderReady("The file changed while it was being described. Run the check again.");
+        return;
+      }
+      descriptionCache.set(node.id, report);
+      renderReport(report);
+    } catch (error) {
+      renderReady((error as Error)?.message || "Could not describe this file.");
+    }
+  }
+
+  function renderReport(report: NodeDescriptionReport): void {
+    const actions = h(
+      "div",
+      { class: "node-description-actions" },
+      h(
+        "button",
+        { class: "node-description-refresh-btn", onclick: () => void startDescription(true) },
+        "↻ Check again",
+      ),
+      h(
+        "button",
+        {
+          class: "node-description-clear-btn",
+          onclick: () => {
+            descriptionCache.delete(node.id);
+            renderReady();
+          },
+        },
+        "Clear",
+      ),
+    );
+    const provider = `${getProviderDisplayName(report.provider)} · ${report.model}`;
+    const details = h("div", { class: "node-description-report" });
+    details.append(
+      h(
+        "div",
+        { class: "node-description-report-head" },
+        h("span", { class: "chip success" }, `${report.confidence} confidence`),
+        h("span", { class: "muted small" }, provider),
+      ),
+      h("p", { class: "node-description-summary" }, report.summary),
+      descriptionBlock("Purpose", h("p", {}, report.purpose)),
+    );
+    if (report.responsibilities.length) {
+      details.append(descriptionBlock("Responsibilities", descriptionList(report.responsibilities)));
+    }
+    if (report.keySymbols.length) {
+      details.append(
+        descriptionBlock(
+          "Key symbols",
+          h(
+            "ul",
+            { class: "node-description-list node-description-symbols" },
+            ...report.keySymbols.map((symbol) =>
+              h(
+                "li",
+                {},
+                symbol.line && ctx.host.openFile
+                  ? h(
+                      "button",
+                      {
+                        class: "link",
+                        onclick: () => ctx.host.openFile?.(node.id, symbol.line),
+                      },
+                      `${symbol.name} · ${symbol.kind} · L${symbol.line}`,
+                    )
+                  : h("strong", {}, `${symbol.name} · ${symbol.kind}`),
+                h("span", {}, symbol.description),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    if (report.dependencies.length) {
+      details.append(descriptionBlock("Dependencies", descriptionList(report.dependencies)));
+    }
+    if (report.dataFlow.length) {
+      details.append(descriptionBlock("Data flow", descriptionList(report.dataFlow)));
+    }
+    if (report.notableDetails.length) {
+      details.append(descriptionBlock("Notable details", descriptionList(report.notableDetails)));
+    }
+    if (report.redactions > 0) {
+      details.append(
+        h(
+          "p",
+          { class: "notice warn node-description-redactions" },
+          `${report.redactions} secret-looking value${report.redactions === 1 ? " was" : "s were"} excluded before analysis.`,
+        ),
+      );
+    }
+    container.replaceChildren(localSummary(), actions, details);
+  }
+}
+
+function descriptionBlock(title: string, content: HTMLElement): HTMLElement {
+  return h("div", { class: "node-description-block" }, h("h4", {}, title), content);
+}
+
+function descriptionList(items: string[]): HTMLElement {
+  return h(
+    "ul",
+    { class: "node-description-list" },
+    ...items.map((item) => h("li", {}, item)),
   );
 }
 

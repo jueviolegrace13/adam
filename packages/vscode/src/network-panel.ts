@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import {
   AI_PROVIDERS,
   analyzeNodeSecurityThreats,
+  describeNodeFile,
   listAiProviderModels,
   probeAiProviderKey,
   type AiProvider,
@@ -128,6 +129,44 @@ export class NetworkPanel implements vscode.Disposable {
             );
             result = probeResult;
           }
+          break;
+        }
+        case "ai:describeNode": {
+          if (!msg.params?.nodeId) throw new Error("Missing nodeId");
+          const summary = await this.secretManager.getConfigSummary();
+          const activeProvider = summary.activeProvider;
+          if (!activeProvider) {
+            throw new Error("No active AI provider configured");
+          }
+          const apiKey = await this.secretManager.getRawKey(activeProvider);
+          if (!apiKey) {
+            throw new Error(`No API key configured for provider ${activeProvider}`);
+          }
+          const nodeRes = await this.client.request<{
+            node: GraphNode;
+            content: string;
+            masked: boolean;
+            redactions: number;
+          }>("GET", `/api/node?id=${encodeURIComponent(msg.params.nodeId)}`);
+
+          if (nodeRes.node.sensitive || nodeRes.masked) {
+            throw new Error("Sensitive files cannot be sent to an AI model");
+          }
+          if (nodeRes.node.binary) {
+            throw new Error("Binary files cannot be described by an AI model");
+          }
+
+          result = await describeNodeFile({
+            node: nodeRes.node,
+            content: {
+              content: nodeRes.content,
+              masked: nodeRes.masked,
+              redactions: nodeRes.redactions,
+            },
+            provider: activeProvider,
+            apiKey,
+            model: summary.providers[activeProvider]?.selectedModel,
+          });
           break;
         }
         case "ai:analyzeThreats": {

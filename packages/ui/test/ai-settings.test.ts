@@ -348,6 +348,7 @@ describe("AI Settings Dialog Component", () => {
         };
       }),
       listAiModels: vi.fn().mockResolvedValue([]),
+      describeNode: vi.fn(),
       analyzeNodeThreats: vi.fn(),
     };
   });

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import type { GraphNode, NodeThreatReport } from "@adam/core";
+import type { GraphNode, NodeDescriptionReport, NodeThreatReport } from "@adam/core";
 import {
+  descriptionCache,
   patchedThreats,
   renderNodePanel,
   threatCache,
@@ -275,6 +276,7 @@ function makeHost(overrides: Partial<Host> = {}): Host {
     setActiveAiProvider: vi.fn(),
     validateAiKey: vi.fn(),
     listAiModels: vi.fn().mockResolvedValue([]),
+    describeNode: vi.fn(),
     analyzeNodeThreats: vi.fn(),
     ...overrides,
   };
@@ -311,11 +313,142 @@ const sampleReport: NodeThreatReport = {
   ],
 };
 
+const sampleDescription: NodeDescriptionReport = {
+  nodeId: "src/auth.ts",
+  nodeHash: "abc123hash",
+  provider: "chatgpt",
+  model: "gpt-4o",
+  analyzedAt: "2026-10-20T10:00:00Z",
+  summary: "Defines the authentication workflow for the application.",
+  purpose: "Validate credentials and establish authenticated sessions.",
+  responsibilities: ["Validate login input", "Create signed session tokens"],
+  keySymbols: [
+    {
+      name: "login",
+      kind: "function",
+      description: "Validates credentials and returns a session token.",
+      line: 42,
+    },
+  ],
+  dependencies: ["jsonwebtoken signs session tokens"],
+  dataFlow: ["Credentials enter through login", "A signed token is returned"],
+  notableDetails: ["Reads AUTH_SECRET from configuration"],
+  confidence: "high",
+  masked: false,
+  redactions: 1,
+};
+
 describe("Node Security Threats Panel", () => {
   beforeEach(() => {
     setupMockDom();
+    descriptionCache.clear();
     threatCache.clear();
     patchedThreats.clear();
+  });
+
+  it("renders a safe description for the selected file", () => {
+    const container = new MockElement("div") as any;
+    const node = makeNode({
+      symbols: [
+        { id: "Auth", name: "Auth", kind: "class", exported: true, signature: "class Auth", start: { line: 1, column: 0 }, end: { line: 8, column: 1 } },
+        { id: "Auth.login", name: "login", kind: "method", exported: false, parent: "Auth", signature: "login()", start: { line: 2, column: 2 }, end: { line: 6, column: 3 } },
+      ],
+      packages: ["zod"],
+      envReads: ["AUTH_SECRET"],
+    });
+    const ctx: PanelContext = {
+      host: makeHost(),
+      incoming: [{ id: "src/app.ts->src/auth.ts:imports", source: "src/app.ts", target: node.id, kind: "imports", specifier: "./auth", typeOnly: false }],
+      outgoing: [
+        { id: "src/auth.ts->src/db.ts:imports", source: node.id, target: "src/db.ts", kind: "imports", specifier: "./db", typeOnly: false },
+        { id: "src/auth.ts->src/types.ts:imports", source: node.id, target: "src/types.ts", kind: "imports", specifier: "./types", typeOnly: true },
+      ],
+      onSelect: vi.fn(),
+    };
+
+    renderNodePanel(container, node, ctx);
+
+    const description = container.querySelector(".panel-description");
+    expect(description).toBeTruthy();
+    expect(description.textContent).toContain("TypeScript source");
+    expect(description.textContent).toContain("defines 1 class, 1 method");
+    expect(description.textContent).toContain("imports 2 local files");
+    expect(description.textContent).toContain("is imported by 1 file");
+    expect(description.textContent).toContain("uses zod");
+    expect(description.textContent).toContain("reads 1 environment or configuration value");
+  });
+
+  it("describes protected and binary files without exposing contents", () => {
+    const container = new MockElement("div") as any;
+    const ctx: PanelContext = { host: makeHost(), incoming: [], outgoing: [], onSelect: vi.fn() };
+
+    renderNodePanel(container, makeNode({ language: "dotenv", sensitive: true, envDeclares: ["API_KEY"] }), ctx);
+    expect(container.querySelector(".panel-description")?.textContent).toContain("values remain hidden");
+    expect(container.querySelector(".panel-description")?.textContent).toContain("declared key");
+
+    renderNodePanel(container, makeNode({ language: "png", binary: true }), ctx);
+    expect(container.querySelector(".panel-description")?.textContent).toContain("binary png file");
+    expect(container.querySelector(".panel-description")?.textContent).toContain("not parsed");
+  });
+
+  it("checks and describes a selected non-sensitive file with the active provider", async () => {
+    const container = new MockElement("div") as any;
+    const node = makeNode();
+    const host = makeHost({
+      kind: "vscode",
+      describeNode: vi.fn().mockResolvedValue(sampleDescription),
+    });
+    const ctx: PanelContext = { host, incoming: [], outgoing: [], onSelect: vi.fn() };
+
+    renderNodePanel(container, node, ctx);
+    const describeBtn = container.querySelector(".node-describe-btn");
+    expect(describeBtn).toBeTruthy();
+    expect(describeBtn.textContent).toContain("Check & Describe");
+
+    describeBtn.click();
+    expect(host.describeNode).toHaveBeenCalledWith({ nodeId: node.id, forceRefresh: false });
+
+    await vi.waitFor(() => {
+      expect(container.querySelector(".node-description-report")).toBeTruthy();
+    });
+
+    expect(descriptionCache.get(node.id)).toEqual(sampleDescription);
+    expect(container.textContent).toContain("Defines the authentication workflow");
+    expect(container.textContent).toContain("Validate login input");
+    expect(container.textContent).toContain("1 secret-looking value was excluded before analysis");
+
+    container.querySelector(".node-description-symbols")?.querySelector(".link")?.click();
+    expect(host.openFile).toHaveBeenCalledWith(node.id, 42);
+  });
+
+  it("does not offer AI description for sensitive files", () => {
+    const container = new MockElement("div") as any;
+    const host = makeHost({ kind: "vscode", describeNode: vi.fn() });
+    const node = makeNode({ sensitive: true, sensitiveReason: "Contains credentials" });
+
+    renderNodePanel(container, node, { host, incoming: [], outgoing: [], onSelect: vi.fn() });
+
+    expect(container.querySelector(".node-describe-btn")).toBeNull();
+    expect(container.querySelector(".node-description-sensitive-notice")?.textContent).toContain(
+      "will not be sent to an external model",
+    );
+    expect(host.describeNode).not.toHaveBeenCalled();
+  });
+
+  it("discards a cached description when the node hash changes", () => {
+    const container = new MockElement("div") as any;
+    const host = makeHost({ kind: "vscode" });
+    descriptionCache.set("src/auth.ts", sampleDescription);
+
+    renderNodePanel(
+      container,
+      makeNode({ hash: "changed-hash" }),
+      { host, incoming: [], outgoing: [], onSelect: vi.fn() },
+    );
+
+    expect(descriptionCache.has("src/auth.ts")).toBe(false);
+    expect(container.querySelector(".node-describe-btn")).toBeTruthy();
+    expect(container.querySelector(".node-description-report")).toBeNull();
   });
 
   it("renders unscanned state with prominent trace button and subtitle", () => {

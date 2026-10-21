@@ -137,6 +137,52 @@ export interface AiValidationResult {
   latencyMs?: number;
 }
 
+/** Confidence assigned by the model to a source-grounded node description. */
+export type NodeDescriptionConfidence = "high" | "medium" | "low";
+
+export interface NodeDescriptionSymbol {
+  name: string;
+  kind: string;
+  description: string;
+  line?: number;
+}
+
+/** Structured explanation of one selected, non-sensitive source file. */
+export interface NodeDescriptionReport {
+  nodeId: string;
+  /** Used by the UI to discard a cached report after the file changes. */
+  nodeHash: string;
+  provider: AiProvider;
+  model: string;
+  analyzedAt: string;
+  summary: string;
+  purpose: string;
+  responsibilities: string[];
+  keySymbols: NodeDescriptionSymbol[];
+  dependencies: string[];
+  dataFlow: string[];
+  notableDetails: string[];
+  confidence: NodeDescriptionConfidence;
+  masked: boolean;
+  redactions: number;
+}
+
+export interface DescribeNodeRequest {
+  nodeId: string;
+  forceRefresh?: boolean;
+}
+
+export class NodeDescriptionError extends Error {
+  constructor(
+    message: string,
+    readonly code?: "UNCONFIGURED" | "SENSITIVE_NODE" | "UNSUPPORTED_NODE" | "PROVIDER_ERROR" | "PARSE_ERROR" | "INVALID_REQUEST",
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = "NodeDescriptionError";
+  }
+}
+
 /** Security Threat Severity Levels */
 export type ThreatSeverity = "critical" | "high" | "medium" | "low" | "info";
 

@@ -82,6 +82,11 @@ Open any project folder and run **Adam: Open Network View**. To remove it later,
 - **Panel:** for a file, language, size, imports, imported-by, packages and env variables it
   reads. For a folder, its size, the folders it imports from and is imported by (with counts),
   and its files.
+- **Check and describe:** in the VS Code extension, configure an AI provider from the toolbar,
+  select a non-sensitive text file, and choose **Check & Describe** in its Description section.
+  The result explains the file's purpose, responsibilities, key symbols, dependencies and data
+  flow. Sensitive and binary files are excluded; secret-looking values in ordinary files are
+  removed before the provider request.
 - **Symbols:** functions, classes, methods and types are listed collapsed. Open one to see only
   its code; **Open at line** jumps to it in the editor.
 - **Manual editing:** **Open in editor** opens the file beside the network. Save a change (for

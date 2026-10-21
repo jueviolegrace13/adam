@@ -21,6 +21,9 @@ Phase 0 slice, working end to end:
   click around its neighbours.
 - Node panel with symbols collapsed by default; open one to read only its code, or jump to the
   editor to change it by hand.
+- VS Code AI tools with bring-your-own provider keys: check and describe a selected file, or scan
+  it for structured security findings. Sensitive files are excluded, and secret-looking values in
+  ordinary source files are redacted before any provider request.
 - C# and .NET: classes, records, interfaces, methods and properties as symbols; edges from the
   types each file uses (through namespaces, usings, aliases and project references), extension
   method calls and partial types; `.sln`/`.slnx` → project and `<ProjectReference>` edges;
