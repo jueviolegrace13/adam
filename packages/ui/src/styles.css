@@ -1730,8 +1730,40 @@ body.vscode-high-contrast .threat-severity-badge.info {
   outline: 1px solid var(--accent);
 }
 
-/* In the Folders view there are no groups, so the details panel takes the whole sidebar. */
-.sidebar:has(.side-groups[hidden]) .side-info[open] {
+/* When Groups is collapsed, or hidden as in the Folders view, the open details panel takes the
+   space it leaves instead of keeping its 60% cap. Collapsed sections keep only their heading. */
+.sidebar:has(.side-groups[hidden]) .side-info[open],
+.sidebar:has(.side-groups:not([open])) .side-info[open] {
   flex: 1 1 auto;
   max-height: none;
+}
+
+/* Long paths and identifiers wrap inside the sidebar instead of scrolling it sideways.
+   Code blocks keep their own horizontal scroll. */
+.side-info,
+.side-groups {
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* Symbol rows keep their kind, export badge and line number whole; only the name shrinks.
+   Rows are grid items, so they need min-width: 0 to shrink below their content. */
+.symbol {
+  min-width: 0;
+}
+
+.symbol > summary {
+  overflow-wrap: normal;
+}
+
+.symbol > summary > .kind,
+.symbol > summary > .exported,
+.symbol > summary > .line {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.symbol > summary > .symbol-name {
+  min-width: 0;
 }
